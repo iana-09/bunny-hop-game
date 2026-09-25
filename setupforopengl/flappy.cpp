@@ -16,6 +16,64 @@
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 
+// --- MP3 playback helpers using MCI ---
+// Uses mciSendStringA to support MP3 playback with aliases.
+// Each sound has an alias so we can seek/replay without reopening every time.
+
+static void MCI_Do(const char* cmd) {
+    // ignore return values for brevity; you can check errors if desired
+    mciSendStringA(cmd, nullptr, 0, nullptr);
+}
+
+static void OpenAliasIfNeeded(const char* path, const char* alias) {
+    char cmd[512];
+    // Try "status alias mode" to see if it exists; if it fails, open it.
+    snprintf(cmd, sizeof(cmd), "status %s mode", alias);
+    char out[128] = {};
+    if (mciSendStringA(cmd, out, sizeof(out), nullptr) != 0) {
+        // not opened -> open it
+        snprintf(cmd, sizeof(cmd), "open \"%s\" type mpegvideo alias %s", path, alias);
+        MCI_Do(cmd);
+    }
+}
+
+static void PlayAliasLoop(const char* path, const char* alias) {
+    OpenAliasIfNeeded(path, alias);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "play %s from 0 repeat", alias);
+    MCI_Do(cmd);
+}
+
+static void StopAndCloseAlias(const char* alias) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "stop %s", alias);
+    MCI_Do(cmd);
+    snprintf(cmd, sizeof(cmd), "close %s", alias);
+    MCI_Do(cmd);
+}
+
+static void PlayAliasOnce(const char* path, const char* alias) {
+    OpenAliasIfNeeded(path, alias);
+    // restart from start and play once (no repeat)
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "stop %s", alias); MCI_Do(cmd);
+    snprintf(cmd, sizeof(cmd), "seek %s to start", alias); MCI_Do(cmd);
+    snprintf(cmd, sizeof(cmd), "play %s from 0", alias); MCI_Do(cmd);
+}
+
+static void PlayHopSound() {
+    // The hop effect is very short; cycling aliases avoids the audible delay from
+    // restarting the same MP3 alias on every flap.
+    static int nextHopAlias = 0;
+    const char* alias = (nextHopAlias++ & 1) ? "hopA" : "hopB";
+
+    PlayAliasOnce("sounds\\hop.mp3", alias);
+}
+
+static void PlayDeathSound() {
+    PlayAliasOnce("sounds\\death.mp3", "death");
+}
+
 using Clock = std::chrono::high_resolution_clock;
 
 const char* vertexSrc = R"glsl(
@@ -117,8 +175,9 @@ int main() {
     glfwMakeContextCurrent(win);
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { std::cerr << "GLAD init failed\n"; return -1; }
 
-    // Play lobby music (looping)
-    PlaySound(TEXT("lobby.wav"), nullptr, SND_FILENAME | SND_ASYNC | SND_LOOP);
+    // Start lobby MP3 loop (menu music). Use MCI alias "lobby".
+    PlayAliasLoop("sounds\\lobby.MP3", "lobby");
+
 
 
     // Programs
@@ -218,6 +277,8 @@ int main() {
     float bunnyAnimTimer = 0.0f; const float bunnyAnimDuration = 0.2f;
     int bunnyFrame = 0;
     bool firstFlapDone = false;
+    bool deathSoundPlayed = false;
+
 
     double mouseX = 0, mouseY = 0; bool mouseJustPressed = false, clickFlag = false;
     glfwSetWindowUserPointer(win, &clickFlag);
@@ -279,21 +340,41 @@ int main() {
 
     // Button callbacks
     startBtn.onClick = [&]() {
+        StopAndCloseAlias("lobby");
+        OpenAliasIfNeeded("sounds\\hop.mp3", "hopA");
+        OpenAliasIfNeeded("sounds\\hop.mp3", "hopB");
+        OpenAliasIfNeeded("sounds\\death.mp3", "death");
         birdY = 0.0f; pipes.clear(); timeSinceSpawn = 0; score = 0;
         gameStarted = true; gameOver = false; firstFlapDone = false;
+        deathSoundPlayed = false; // reset flag
         startBtn.visible = false; resetBtn.visible = false;
         exitBtn.visible = false;
         char buf[128]; snprintf(buf, sizeof(buf), "Bunny Hop Adventure - Score: %d", score); glfwSetWindowTitle(win, buf);
         };
+
     resetBtn.onClick = [&]() {
         birdY = 0.0f; pipes.clear(); timeSinceSpawn = 0; score = 0;
         gameStarted = false; gameOver = false; firstFlapDone = false;
+        deathSoundPlayed = false; // reset flag
         startBtn.visible = true; exitBtn.visible = true; resetBtn.visible = false;
         char buf[128];
         snprintf(buf, sizeof(buf), "Bunny Hop Adventure - Best: %d", bestScore);
         glfwSetWindowTitle(win, buf);
         };
+
     exitBtn.onClick = [&]() { glfwSetWindowShouldClose(win, 1); };
+
+    auto triggerDeath = [&]() {
+        if (gameOver) return;
+
+        gameOver = true;
+        if (!deathSoundPlayed) {
+            PlayDeathSound();
+            deathSoundPlayed = true;
+        }
+        resetBtn.visible = true;
+        exitBtn.visible = true;
+    };
 
     auto now = Clock::now(); auto last = now;
     auto startTime = Clock::now();
@@ -406,6 +487,7 @@ int main() {
         startBtn.w = resetBtn.w = exitBtn.w = BTN_W * btnScale;
         startBtn.h = resetBtn.h = exitBtn.h = BTN_H * btnScale;
 
+        // Button Positions
         startBtn.x = fbw * 0.5f;
         startBtn.y = fbh * 0.38f + startBtn.h * 0.25f;
 
@@ -415,52 +497,79 @@ int main() {
 
         resetBtn.x = fbw * 0.5f;
         resetBtn.y = fbh * 0.5f;
-        // -----------------------------
+        // --------------------------------------------
 
         glfwPollEvents();
 
-        if (clickFlag) { glfwGetCursorPos(win, &mouseX, &mouseY); mouseJustPressed = true; clickFlag = false; }
+        // Mouse click system
+        if (clickFlag) {
+            glfwGetCursorPos(win, &mouseX, &mouseY);
+            mouseJustPressed = true;
+            clickFlag = false;
+        }
 
+        // Space key detection
         static bool spacePrev = false;
         bool spaceNow = (glfwGetKey(win, GLFW_KEY_SPACE) == GLFW_PRESS);
 
-        // Mouse click hop or button clicks
+        // --- BUTTON CLICK HANDLING + MOUSE FLAP ---
         if (mouseJustPressed) {
+
+            // Start button
             if (startBtn.visible &&
-                (mouseX >= startBtn.x - startBtn.w / 2 && mouseX <= startBtn.x + startBtn.w / 2 &&
-                    mouseY >= startBtn.y - startBtn.h / 2 && mouseY <= startBtn.y + startBtn.h / 2)) {
+                mouseX >= startBtn.x - startBtn.w / 2 &&
+                mouseX <= startBtn.x + startBtn.w / 2 &&
+                mouseY >= startBtn.y - startBtn.h / 2 &&
+                mouseY <= startBtn.y + startBtn.h / 2)
+            {
                 startBtn.onClick();
             }
+
+            // Reset button
             else if (resetBtn.visible &&
-                (mouseX >= resetBtn.x - resetBtn.w / 2 && mouseX <= resetBtn.x + resetBtn.w / 2 &&
-                    mouseY >= resetBtn.y - resetBtn.h / 2 && mouseY <= resetBtn.y + resetBtn.h / 2)) {
+                mouseX >= resetBtn.x - resetBtn.w / 2 &&
+                mouseX <= resetBtn.x + resetBtn.w / 2 &&
+                mouseY >= resetBtn.y - resetBtn.h / 2 &&
+                mouseY <= resetBtn.y + resetBtn.h / 2)
+            {
                 resetBtn.onClick();
             }
+
+            // Exit button
             else if (exitBtn.visible &&
-                (mouseX >= exitBtn.x - exitBtn.w / 2 && mouseX <= exitBtn.x + exitBtn.w / 2 &&
-                    mouseY >= exitBtn.y - exitBtn.h / 2 && mouseY <= exitBtn.y + exitBtn.h / 2)) {
+                mouseX >= exitBtn.x - exitBtn.w / 2 &&
+                mouseX <= exitBtn.x + exitBtn.w / 2 &&
+                mouseY >= exitBtn.y - exitBtn.h / 2 &&
+                mouseY <= exitBtn.y + exitBtn.h / 2)
+            {
                 exitBtn.onClick();
             }
+
+            // Flap
             else if (gameStarted && !gameOver) {
-                birdVel = +flapStrength;
+                birdVel = flapStrength;
                 firstFlapDone = true;
-                PlaySound(TEXT("hop.wav"), nullptr, SND_FILENAME | SND_ASYNC);
+                PlayHopSound();
             }
+
             mouseJustPressed = false;
         }
 
+        // Space flap
         if (gameStarted && !gameOver && spaceNow && !spacePrev) {
-            birdVel = +flapStrength;
+            birdVel = flapStrength;
             firstFlapDone = true;
-            PlaySound(TEXT("hop.wav"), nullptr, SND_FILENAME | SND_ASYNC);
+            PlayHopSound();
         }
         spacePrev = spaceNow;
 
+        // --- PHYSICS UPDATE ---
         if (gameStarted && firstFlapDone) {
             birdVel += gravity * dt;
             birdY += birdVel * dt;
         }
 
+        // Floor collision
         if (birdY + birdRadius > 1.0f) {
             birdY = 1.0f - birdRadius;
             birdVel = 0;
@@ -468,11 +577,11 @@ int main() {
 
         if (birdY - birdRadius < -1.0f) {
             birdY = -1.0f + birdRadius;
-            gameOver = true;
-            resetBtn.visible = true;
-            exitBtn.visible = true;
+            triggerDeath();
         }
 
+
+        // --- GAME NOT STARTED ---
         if (!gameStarted) {
             birdY = 0.0f;
             birdVel = 0.0f;
@@ -481,134 +590,189 @@ int main() {
             resetBtn.visible = false;
         }
 
+        // --- PIPE SPAWNING ---
         if (gameStarted && !gameOver) {
+
             timeSinceSpawn += dt;
+
             if (timeSinceSpawn > spawnInterval) {
                 timeSinceSpawn = 0.0f;
+
                 Pipe p;
                 p.x = 1.2f;
                 p.width = pipeWidth;
                 p.gapSize = pipeGapSize;
+
                 float margin = 0.2f;
                 float halfGap = p.gapSize * 0.5f;
-                p.gapY = -1.0f + margin + halfGap + ((float)rand() / RAND_MAX) * (2.0f - 2.0f * margin - p.gapSize);
+
+                p.gapY = -1.0f + margin + halfGap +
+                    ((float)rand() / RAND_MAX) * (2.0f - 2.0f * margin - p.gapSize);
+
                 p.scored = false;
                 pipes.push_back(p);
             }
         }
 
+        // --- PIPE MOVEMENT ---
         if (gameStarted && !gameOver) {
-            for (auto& p : pipes) p.x -= pipeSpeed * dt;
+            for (auto& p : pipes)
+                p.x -= pipeSpeed * dt;
         }
 
+        // --- SCORING ---
         for (auto& p : pipes) {
             if (!p.scored && p.x + p.width * 0.5f < birdX) {
                 p.scored = true;
                 score++;
                 if (score > bestScore) bestScore = score;
-                char buf[128]; snprintf(buf, sizeof(buf), "Bunny Hop Adventure - Score: %d  Best: %d", score, bestScore);
+
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                    "Bunny Hop Adventure - Score: %d  Best: %d",
+                    score, bestScore
+                );
                 glfwSetWindowTitle(win, buf);
             }
         }
 
-        while (!pipes.empty() && pipes.front().x + pipes.front().width < -1.5f) pipes.erase(pipes.begin());
+        // Remove offscreen pipes
+        while (!pipes.empty() && pipes.front().x + pipes.front().width < -1.5f)
+            pipes.erase(pipes.begin());
 
+        // --- COLLISION CHECK ---
         float aspect = (float)fbw / (float)fbh;
+
         for (auto& p : pipes) {
+
             float pl = p.x - p.width * 0.5f;
             float pr = p.x + p.width * 0.5f;
             float gt = p.gapY + p.gapSize * 0.5f;
             float gb = p.gapY - p.gapSize * 0.5f;
 
+            // Scale for aspect ratio
             float scaledBirdLeft = (birdX - birdRadius) * aspect;
             float scaledBirdRight = (birdX + birdRadius) * aspect;
             float scaledPipeLeft = pl * aspect;
             float scaledPipeRight = pr * aspect;
 
-            bool overlapsX = !(scaledBirdRight < scaledPipeLeft || scaledBirdLeft > scaledPipeRight);
-            bool insideGap = (birdY + birdRadius < gt) && (birdY - birdRadius > gb);
+            bool overlapsX = !(scaledBirdRight < scaledPipeLeft ||
+                scaledBirdLeft > scaledPipeRight);
+
+            bool insideGap = (birdY + birdRadius < gt &&
+                birdY - birdRadius > gb);
 
             if (overlapsX && !insideGap) {
-                gameOver = true;
-                resetBtn.visible = true;
-                exitBtn.visible = true;
+                triggerDeath();
                 break;
             }
         }
 
-        for (auto& c : clouds) {
+
+            // --- CLOUD MOVEMENT ---
+            for (auto& c : clouds) {
+                if (!gameOver) {
+                    c.x_px -= c.speed * dt;
+                    if (c.x_px + c.w_px < 0)
+                        c.x_px = WIN_W + 10.0f;
+                }
+            }
+
+            // --- ANIMATION ---
             if (!gameOver) {
-                c.x_px -= c.speed * dt;
-                if (c.x_px + c.w_px < 0) c.x_px = WIN_W + 10.0f;
+                bunnyAnimTimer += dt;
+                if (bunnyAnimTimer >= bunnyAnimDuration) {
+                    bunnyAnimTimer = 0.0f;
+                    bunnyFrame = (bunnyFrame + 1) % 2;
+                }
             }
-        }
 
-        if (!gameOver) {
-            bunnyAnimTimer += dt;
-            if (bunnyAnimTimer >= bunnyAnimDuration) {
-                bunnyAnimTimer = 0.0f;
-                bunnyFrame = (bunnyFrame + 1) % 2;
+            // --- RENDERING ---
+            glViewport(0, 0, fbw, fbh);
+            glClearColor(0.53f, 0.81f, 0.92f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            // Grass
+            if (grassTex) {
+                const float grassOrigAspect = 940.0f / 788.0f;
+                float grassHeight = fbh * 0.12f;
+                float grassWidth = grassHeight * grassOrigAspect;
+                float grassY = fbh - grassHeight * 0.5f;
+
+                int numTiles = (int)ceilf((float)fbw / grassWidth) + 1;
+
+                for (int i = 0; i < numTiles; i++) {
+                    float grassX = i * grassWidth + grassWidth * 0.5f;
+                    drawTexPixel(grassTex, grassX, grassY,
+                        grassWidth, grassHeight, fbw, fbh, 1.0f);
+                }
             }
-        }
 
-        glViewport(0, 0, fbw, fbh);
-        glClearColor(0.53f, 0.81f, 0.92f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+            // Clouds
+            for (auto& c : clouds)
+                drawTexPixel(c.tex,
+                    c.x_px + c.w_px * 0.5f,
+                    c.y_px + c.h_px * 0.5f,
+                    c.w_px, c.h_px,
+                    fbw, fbh, 0.95f);
 
-        if (grassTex) {
-            const float grassOrigAspect = 940.0f / 788.0f;
-            float grassHeight = fbh * 0.12f;
-            float grassWidth = grassHeight * grassOrigAspect;
-            float grassY = fbh - grassHeight * 0.5f;
-            int numTiles = (int)ceilf((float)fbw / grassWidth) + 1;
-            for (int i = 0; i < numTiles; i++) {
-                float grassX = i * grassWidth + grassWidth * 0.5f;
-                drawTexPixel(grassTex, grassX, grassY, grassWidth, grassHeight, fbw, fbh, 1.0f);
+            // Pipes
+            glUseProgram(prog);
+            glBindVertexArray(vao);
+
+            const float pipeR = 0.45f, pipeG = 0.8f, pipeB = 0.45f;
+
+            for (auto& p : pipes) {
+
+                float pl = p.x - p.width * 0.5f;
+                float pr = p.x + p.width * 0.5f;
+                float gt = p.gapY + p.gapSize * 0.5f;
+                float gb = p.gapY - p.gapSize * 0.5f;
+
+                // Top pipe
+                float topHeight = 1.0f - gt;
+                float topCenterY = gt + topHeight * 0.5f;
+
+                glUniform3f(locColor, pipeR, pipeG, pipeB);
+                glUniform2f(locPos, (pl + pr) * 0.5f, topCenterY);
+                glUniform2f(locScale, p.width, topHeight);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+
+                // Bottom pipe
+                float bottomHeight = gb + 1.0f;
+                float bottomCenterY = -1.0f + bottomHeight * 0.5f;
+
+                glUniform3f(locColor, pipeR * 0.92f, pipeG * 0.92f, pipeB * 0.92f);
+                glUniform2f(locPos, (pl + pr) * 0.5f, bottomCenterY);
+                glUniform2f(locScale, p.width, bottomHeight);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
             }
-        }
 
-        for (auto& c : clouds) drawTexPixel(c.tex, c.x_px + c.w_px * 0.5f, c.y_px + c.h_px * 0.5f, c.w_px, c.h_px, fbw, fbh, 0.95f);
+            // Bunny
+            glUseProgram(texProg);
+            glBindVertexArray(vaoTex);
 
-        glUseProgram(prog);
-        glBindVertexArray(vao);
-        const float pipeR = 0.45f, pipeG = 0.8f, pipeB = 0.45f;
+            GLuint currentBunnyTex =
+                gameOver ? bunnyTexDied :
+                (bunnyFrame == 0 ? bunnyTexIdle : bunnyTexFlap);
 
-        for (auto& p : pipes) {
-            float pl = p.x - p.width * 0.5f;
-            float pr = p.x + p.width * 0.5f;
-            float gt = p.gapY + p.gapSize * 0.5f;
-            float gb = p.gapY - p.gapSize * 0.5f;
+            float bunny_px_x = ((birdX + 1.0f) * 0.5f) * fbw;
+            float bunny_px_y = ((1.0f - birdY) * 0.5f) * fbh;
 
-            float topHeight = 1.0f - gt;
-            float topCenterY = gt + topHeight * 0.5f;
-            glUniform3f(locColor, pipeR, pipeG, pipeB);
-            glUniform2f(locPos, (pl + pr) * 0.5f, topCenterY);
-            glUniform2f(locScale, p.width, topHeight);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+            drawTexPixel(currentBunnyTex, bunny_px_x, bunny_px_y,
+                90, 90, fbw, fbh);
 
-            float bottomHeight = gb + 1.0f;
-            float bottomCenterY = -1.0f + bottomHeight * 0.5f;
-            glUniform3f(locColor, pipeR * 0.92f, pipeG * 0.92f, pipeB * 0.92f);
-            glUniform2f(locPos, (pl + pr) * 0.5f, bottomCenterY);
-            glUniform2f(locScale, p.width, bottomHeight);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-        }
+            // UI
+            drawScore(score, fbw, fbh, gameOver);
+            drawButton(startBtn, fbw, fbh);
+            drawButton(exitBtn, fbw, fbh);
+            drawButton(resetBtn, fbw, fbh);
 
-        glUseProgram(texProg);
-        glBindVertexArray(vaoTex);
-        GLuint currentBunnyTex = gameOver ? bunnyTexDied : (bunnyFrame == 0 ? bunnyTexIdle : bunnyTexFlap);
-        float bunny_px_x = ((birdX + 1.0f) * 0.5f) * fbw;
-        float bunny_px_y = ((1.0f - birdY) * 0.5f) * fbh;
-        drawTexPixel(currentBunnyTex, bunny_px_x, bunny_px_y, 90, 90, fbw, fbh);
+            glfwSwapBuffers(win);
 
-        drawScore(score, fbw, fbh, gameOver);
-        drawButton(startBtn, fbw, fbh);
-        drawButton(exitBtn, fbw, fbh);
-        drawButton(resetBtn, fbw, fbh);
+            // End loop
+         }
 
-        glfwSwapBuffers(win);
-    }
-
-    glfwTerminate();
-    return 0;
+         glfwTerminate();
+         return 0;
 }
